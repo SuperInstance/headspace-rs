@@ -1,0 +1,22 @@
+[package]
+name = "headspace-rs"
+version = "0.1.0"
+edition = "2021"
+description = "ARM-optimized vector embedding sidecar for headspace"
+
+[dependencies]
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+# Compile for Neoverse N1 (Graviton 2/3). Pass via RUSTFLAGS or .cargo/config.toml.
+# RUSTFLAGS="-C target-cpu=neoverse-n1" cargo build --release
