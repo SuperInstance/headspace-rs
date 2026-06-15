@@ -14,13 +14,14 @@ mod vector;
 
 use axum::{
     Router,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
@@ -71,10 +72,13 @@ impl AppState {
 #[derive(Debug, Deserialize)]
 struct SegmentRequest {
     text: String,
-    /// Optional pre-computed embedding.  If absent, the server returns
-    /// a placeholder embedding for the caller to fill (see design notes).
+    /// Optional pre-computed embedding.
     #[serde(default)]
     embedding: Option<Vec<f32>>,
+    /// Optional namespace for partitioning (e.g. "pulse", "lures").
+    namespace: Option<String>,
+    /// Optional TTL in seconds from creation time.
+    ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +86,9 @@ struct SegmentResponse {
     id: String,
     text: String,
     dimensions: usize,
+    namespace: Option<String>,
+    ttl_seconds: Option<u64>,
+    created_at: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,10 +99,8 @@ struct QueryRequest {
     /// Number of results to return (default 5).
     #[serde(default = "default_k")]
     k: usize,
-}
-
-fn default_k() -> usize {
-    5
+    /// Optional namespace filter.
+    namespace: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,6 +113,35 @@ struct QueryResponse {
 struct StatusResponse {
     segments: usize,
     api_version: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecentParams {
+    namespace: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+fn default_k() -> usize { 5 }
+
+fn default_limit() -> usize { 10 }
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DeleteNamespaceResponse {
+    deleted: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct RecentResponse {
+    segments: Vec<SegmentSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct SegmentSummary {
+    id: String,
+    text: String,
+    namespace: Option<String>,
+    created_at: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -135,22 +169,26 @@ async fn handle_segment(
     }
 
     // If the caller didn't supply an embedding, create a placeholder.
-    // The Python caller is expected to generate the actual embedding
-    // and submit it via a separate call or with the segment.
     let embedding = req.embedding.unwrap_or_else(|| {
-        // Default 384-dimensional placeholder (all-zeros)
         vec![0.0_f32; 384]
     });
 
     let id = Uuid::new_v4().to_string();
     let dims = embedding.len();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
     {
         let mut segs = state.segments.write().await;
         segs.push(Segment {
             id: id.clone(),
-            text,
+            text: text.clone(),
             embedding,
+            namespace: req.namespace.clone(),
+            ttl_seconds: req.ttl_seconds,
+            created_at: now,
         });
     }
     state.persist().await;
@@ -159,6 +197,9 @@ async fn handle_segment(
         id,
         text: req.text,
         dimensions: dims,
+        namespace: req.namespace,
+        ttl_seconds: req.ttl_seconds,
+        created_at: now,
     }))
 }
 
@@ -185,7 +226,18 @@ async fn handle_query(
         }));
     }
 
-    let results = nearest_neighbours(&req.embedding, &segments, req.k);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let results = nearest_neighbours(
+        &req.embedding,
+        &segments,
+        req.k,
+        req.namespace.as_deref(),
+        now,
+    );
 
     Ok(Json(QueryResponse {
         results,
@@ -215,8 +267,83 @@ async fn handle_status(
     let count = state.segments.read().await.len();
     Json(StatusResponse {
         segments: count,
-        api_version: "0.1.0",
+        api_version: "0.2.0",
     })
+}
+
+/// GET /api/segment/recent — most recent segments in a namespace.
+async fn handle_recent(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<RecentParams>,
+) -> Json<RecentResponse> {
+    let segments = state.segments.read().await;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut filtered: Vec<&Segment> = segments
+        .iter()
+        .filter(|seg| {
+            let ns_ok = params.namespace.as_deref().map_or(true, |ns| {
+                seg.namespace.as_deref() == Some(ns)
+            });
+            let ttl_ok = seg.ttl_seconds.map_or(true, |ttl| seg.created_at + ttl > now);
+            ns_ok && ttl_ok
+        })
+        .collect();
+
+    filtered.sort_unstable_by(|a, b| b.created_at.cmp(&a.created_at));
+    filtered.truncate(params.limit);
+
+    let segment_summaries: Vec<SegmentSummary> = filtered
+        .into_iter()
+        .map(|s| SegmentSummary {
+            id: s.id.clone(),
+            text: s.text.clone(),
+            namespace: s.namespace.clone(),
+            created_at: s.created_at,
+        })
+        .collect();
+
+    Json(RecentResponse {
+        segments: segment_summaries,
+    })
+}
+
+/// DELETE /api/namespace/:name — delete all segments in a namespace.
+async fn handle_delete_namespace(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Json<DeleteNamespaceResponse> {
+    let deleted = {
+        let mut segs = state.segments.write().await;
+        let before = segs.len();
+        segs.retain(|seg| seg.namespace.as_deref() != Some(&name));
+        before - segs.len()
+    };
+    state.persist().await;
+    Json(DeleteNamespaceResponse { deleted })
+}
+
+/// Purge TTL-expired segments from in-memory state and disk.
+async fn purge_expired(state: &AppState) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let count = {
+        let mut segs = state.segments.write().await;
+        let before = segs.len();
+        segs.retain(|seg| {
+            seg.ttl_seconds.map_or(true, |ttl| seg.created_at + ttl > now)
+        });
+        before - segs.len()
+    };
+    if count > 0 {
+        tracing::info!("purged {count} expired segments");
+        state.persist().await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -235,11 +362,16 @@ async fn main() {
 
     let state = AppState::from_disk().await;
 
+    // Purge expired segments on startup
+    purge_expired(&state).await;
+
     let app = Router::new()
         .route("/api/segment", post(handle_segment))
         .route("/api/query", post(handle_query))
         .route("/api/reset", post(handle_reset))
         .route("/api/status", get(handle_status))
+        .route("/api/segment/recent", get(handle_recent))
+        .route("/api/namespace/{name}", axum::routing::delete(handle_delete_namespace))
         .layer(CorsLayer::permissive())
         .with_state(state);
 

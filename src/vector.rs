@@ -200,6 +200,14 @@ pub struct Segment {
     pub id: String,
     pub text: String,
     pub embedding: Vec<f32>,
+    /// Optional namespace for partitioning segments (e.g. "pulse", "lures").
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// Optional TTL in seconds from created_at (after which segment expires).
+    pub ttl_seconds: Option<u64>,
+    /// Unix epoch seconds when this segment was created.
+    #[serde(default)]
+    pub created_at: u64,
 }
 
 /// A query result pairing a segment with its similarity score.
@@ -220,19 +228,30 @@ pub fn nearest_neighbours(
     query_embedding: &[f32],
     segments: &[Segment],
     k: usize,
+    namespace_filter: Option<&str>,
+    now_unix: u64,
 ) -> Vec<SearchResult> {
-    let k = k.min(segments.len());
+    // Filter eligible segments: optional namespace matching + TTL check
+    let eligible: Vec<&Segment> = segments
+        .iter()
+        .filter(|seg| {
+            let ns_ok = namespace_filter.map_or(true, |ns| seg.namespace.as_deref() == Some(ns));
+            let ttl_ok = seg.ttl_seconds.map_or(true, |ttl| seg.created_at + ttl > now_unix);
+            ns_ok && ttl_ok
+        })
+        .collect();
+
+    let k = k.min(eligible.len());
     if k == 0 {
         return Vec::new();
     }
 
     // Build scored list: (similarity, index)
-    let mut scored: Vec<(f32, usize)> = segments
+    let mut scored: Vec<(f32, usize)> = eligible
         .iter()
         .enumerate()
-        .map(|(idx, seg)| {
-            let sim = cosine_similarity(query_embedding, &seg.embedding);
-            // Use bitwise-reversed f32 for descending sort
+        .map(|(idx, seg_ref)| {
+            let sim = cosine_similarity(query_embedding, &seg_ref.embedding);
             (sim, idx)
         })
         .collect();
@@ -250,10 +269,13 @@ pub fn nearest_neighbours(
 
     scored
         .into_iter()
-        .map(|(score, idx)| SearchResult {
-            id: segments[idx].id.clone(),
-            text: segments[idx].text.clone(),
-            score,
+        .map(|(score, idx)| {
+            let seg = eligible[idx];
+            SearchResult {
+                id: seg.id.clone(),
+                text: seg.text.clone(),
+                score,
+            }
         })
         .collect()
 }
@@ -313,21 +335,30 @@ mod tests {
                 id: "a".into(),
                 text: "hello world".into(),
                 embedding: vec![1.0, 0.0, 0.0],
+                namespace: None,
+                ttl_seconds: None,
+                created_at: 1000,
             },
             Segment {
                 id: "b".into(),
                 text: "goodbye world".into(),
                 embedding: vec![0.0, 1.0, 0.0],
+                namespace: None,
+                ttl_seconds: None,
+                created_at: 1000,
             },
             Segment {
                 id: "c".into(),
                 text: "something else".into(),
                 embedding: vec![0.0, 0.0, 1.0],
+                namespace: None,
+                ttl_seconds: None,
+                created_at: 1000,
             },
         ];
 
         let query: Vec<f32> = vec![0.9, 0.1, 0.0];
-        let results = nearest_neighbours(&query, &segments, 2);
+        let results = nearest_neighbours(&query, &segments, 2, None, 2000);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, "a");
         assert_eq!(results[1].id, "b");
@@ -345,7 +376,7 @@ mod tests {
     fn test_empty_query_no_panic() {
         let segments: Vec<Segment> = vec![];
         let query: Vec<f32> = vec![1.0, 0.0];
-        let results = nearest_neighbours(&query, &segments, 5);
+        let results = nearest_neighbours(&query, &segments, 5, None, 2000);
         assert!(results.is_empty());
     }
 
