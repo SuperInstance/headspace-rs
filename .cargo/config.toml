@@ -1,2 +1,2 @@
 [target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=neoverse-n1"]
+rustflags = ["-C", "target-cpu=neoverse-n1", "-C", "target-feature=+neon,+fp16"]

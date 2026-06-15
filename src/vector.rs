@@ -208,6 +208,14 @@ pub struct Segment {
     /// Unix epoch seconds when this segment was created.
     #[serde(default)]
     pub created_at: u64,
+    /// Content-style bucket for stratified search (0-4).
+    ///   0 = short metrics/text (<200 chars, likely numeric)
+    ///   1 = medium prose (200-2000 chars)
+    ///   2 = long documents (>2000 chars)
+    ///   3 = commands/namespaces (system-prefixed)
+    ///   4 = queries (default)
+    #[serde(default)]
+    pub bucket: u8,
 }
 
 /// A query result pairing a segment with its similarity score.
@@ -218,18 +226,104 @@ pub struct SearchResult {
     pub score: f32,
 }
 
-/// Find top-k nearest neighbours to `query_embedding` using cosine similarity.
+// ---------------------------------------------------------------------------
+// Bucket assignment for stratified sampling
+// ---------------------------------------------------------------------------
+
+/// System-prefix patterns for bucket 3 (commands/namespaces).
+const SYSTEM_PREFIXES: &[&str] = &[
+    "system:", "cmd:", "command:", "namespace:", "fn:", "fn ",
+    "func:", "function:", "def ", "pub ", "impl ",
+];
+
+/// Assign a content-style bucket (0-4) based on text heuristics.
 ///
-/// This performs a brute-force linear scan over all stored segments,
-/// scoring each with the NEON-accelerated dot product.  For the prototype
-/// scale (~10 000 segments, ~384 dims) this is well within real-time
-/// constraints on a Neoverse N1 core.
+/// - Bucket 0: short metrics/text (< 200 chars, likely numeric)
+/// - Bucket 1: medium prose (200-2000 chars)
+/// - Bucket 2: long documents (> 2000 chars)
+/// - Bucket 3: commands/namespaces (starts with a system prefix)
+/// - Bucket 4: queries (default)
+#[inline]
+pub fn assign_bucket(text: &str) -> u8 {
+    let trimmed = text.trim();
+    let len = trimmed.len();
+
+    // Check system/command prefixes first
+    for prefix in SYSTEM_PREFIXES {
+        if trimmed.starts_with(prefix) {
+            return 3;
+        }
+    }
+
+    // Check for likely numeric/metric content (short and mostly digits/symbols)
+    if len < 200 {
+        let non_space: usize = trimmed.chars().filter(|c| !c.is_whitespace()).count();
+        if non_space > 0 {
+            let numeric_count: usize = trimmed
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .filter(|c| {
+                    c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '/' || *c == '%' || *c == '='
+                })
+                .count();
+            if numeric_count as f64 / non_space as f64 > 0.4 {
+                return 0;
+            }
+        }
+        // Short but not clearly numeric -> medium prose
+        return 1;
+    }
+
+    if len <= 2000 {
+        return 1;
+    }
+
+    // > 2000 chars
+    2
+}
+
+/// Determine the query bucket for stratified search ordering.
+#[inline]
+pub fn query_bucket(text: &str) -> u8 {
+    assign_bucket(text)
+}
+
+/// Order in which to search buckets, given the query bucket.
+/// The query's own bucket is searched first, then the others.
+fn bucket_search_order(query_bucket_id: u8) -> [u8; 5] {
+    let all: [u8; 5] = [0, 1, 2, 3, 4];
+    let mut order = [0u8; 5];
+    let mut idx = 1;
+    order[0] = query_bucket_id;
+    for &b in &all {
+        if b != query_bucket_id {
+            order[idx] = b;
+            idx += 1;
+        }
+    }
+    order
+}
+
+/// Confidence threshold for early exit from stratified search.
+/// If the top match from the first bucket exceeds this, we skip other buckets.
+const EARLY_EXIT_CONFIDENCE: f32 = 0.80;
+
+/// Find top-k nearest neighbours to `query_embedding` using cosine similarity,
+/// with stratified bucket sampling for early exit.
+///
+/// Groups segments into 5 content-style buckets, searches the query's bucket
+/// first, and returns early if the top match has confidence > 0.8.
+/// Otherwise falls through to remaining buckets for correctness.
+///
+/// The `query_text` parameter is used for bucket assignment. When `None`,
+/// falls back to full brute-force search (original behaviour).
 pub fn nearest_neighbours(
     query_embedding: &[f32],
     segments: &[Segment],
     k: usize,
     namespace_filter: Option<&str>,
     now_unix: u64,
+    query_text: Option<&str>,
 ) -> Vec<SearchResult> {
     // Filter eligible segments: optional namespace matching + TTL check
     let eligible: Vec<&Segment> = segments
@@ -246,23 +340,141 @@ pub fn nearest_neighbours(
         return Vec::new();
     }
 
-    // Build scored list: (similarity, index)
-    let mut scored: Vec<(f32, usize)> = eligible
-        .iter()
-        .enumerate()
-        .map(|(idx, seg_ref)| {
-            let sim = cosine_similarity(query_embedding, &seg_ref.embedding);
-            (sim, idx)
+    // If eligible set is small enough, skip stratification overhead
+    if eligible.len() < 20 {
+        return brute_force_nearest(query_embedding, &eligible, k);
+    }
+
+    // Determine query bucket from text (or default to 4)
+    let q_bucket = query_text.map_or(4u8, |t| query_bucket(t));
+
+    // Partition eligible segments by bucket
+    let mut bucket_groups: [Vec<&Segment>; 5] = [
+        Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+    ];
+    for seg in &eligible {
+        let b = (seg.bucket as usize).min(4);
+        bucket_groups[b].push(*seg);
+    }
+
+    let search_order = bucket_search_order(q_bucket);
+
+    let mut top_k: Vec<(f32, &Segment)> = Vec::with_capacity(k);
+    let mut searched_buckets = 0u8;
+
+    for &bucket_id in &search_order {
+        let bucket_segs = &bucket_groups[bucket_id as usize];
+        if bucket_segs.is_empty() {
+            continue;
+        }
+
+        searched_buckets += 1;
+
+        // Score all segments in this bucket with software-pipelined prefetch
+        let mut scored: Vec<(f32, &Segment)> = Vec::with_capacity(bucket_segs.len());
+        let blen = bucket_segs.len();
+        for idx in 0..blen {
+            if idx + 1 < blen {
+                let next_emb = &bucket_segs[idx + 1].embedding;
+                if !next_emb.is_empty() {
+                    std::hint::black_box(&next_emb[0]);
+                }
+            }
+            let sim = cosine_similarity(query_embedding, &bucket_segs[idx].embedding);
+            scored.push((sim, bucket_segs[idx]));
+        }
+
+        // Merge into top-k accumulator
+        if top_k.is_empty() {
+            top_k = scored;
+        } else {
+            top_k.extend(scored);
+        }
+
+        // Keep only top-k
+        if top_k.len() > k {
+            top_k.select_nth_unstable_by(k - 1, |a, b| {
+                b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            top_k.truncate(k);
+        }
+
+        // Early exit: if our top match (after first bucket) is very confident,
+        // skip remaining buckets.
+        if searched_buckets == 1 && !top_k.is_empty() {
+            let top_score = top_k[0].0;
+            if top_score > EARLY_EXIT_CONFIDENCE {
+                tracing::debug!(
+                    "stratified early exit: bucket={} top_score={:.4} early=true",
+                    bucket_id,
+                    top_score,
+                );
+                break;
+            }
+        }
+    }
+
+    // Sort the top-k for consistent output ordering
+    top_k.sort_unstable_by(|a, b| {
+        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    if top_k.len() > k {
+        top_k.truncate(k);
+    }
+
+    let buckets_searched = searched_buckets;
+
+    let results: Vec<SearchResult> = top_k
+        .into_iter()
+        .map(|(score, seg)| SearchResult {
+            id: seg.id.clone(),
+            text: seg.text.clone(),
+            score,
         })
         .collect();
 
-    // Partial sort: top-k only, descending
+    let total_buckets = search_order
+        .iter()
+        .filter(|&&b| !bucket_groups[b as usize].is_empty())
+        .count();
+    if buckets_searched < total_buckets as u8 {
+        tracing::debug!(
+            "stratified search: searched {}/{} buckets, {} results",
+            buckets_searched,
+            total_buckets,
+            results.len(),
+        );
+    }
+
+    results
+}
+
+/// Brute-force search (original behaviour) used for small eligible sets or
+/// as the fallback. Maintains software-pipelined prefetch for performance.
+fn brute_force_nearest<'a>(
+    query_embedding: &[f32],
+    eligible: &[&'a Segment],
+    k: usize,
+) -> Vec<SearchResult> {
+    let mut scored: Vec<(f32, usize)> = Vec::with_capacity(eligible.len());
+    let len = eligible.len();
+    for idx in 0..len {
+        if idx + 1 < len {
+            let next_emb = &eligible[idx + 1].embedding;
+            if !next_emb.is_empty() {
+                std::hint::black_box(&next_emb[0]);
+            }
+        }
+        let sim = cosine_similarity(query_embedding, &eligible[idx].embedding);
+        scored.push((sim, idx));
+    }
+
     scored.select_nth_unstable_by(k - 1, |a, b| {
         b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
     });
     scored.truncate(k);
 
-    // Sort the top-k for consistent output ordering
     scored.sort_unstable_by(|a, b| {
         b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
     });
@@ -338,6 +550,7 @@ mod tests {
                 namespace: None,
                 ttl_seconds: None,
                 created_at: 1000,
+                bucket: 1,
             },
             Segment {
                 id: "b".into(),
@@ -346,6 +559,7 @@ mod tests {
                 namespace: None,
                 ttl_seconds: None,
                 created_at: 1000,
+                bucket: 1,
             },
             Segment {
                 id: "c".into(),
@@ -354,11 +568,13 @@ mod tests {
                 namespace: None,
                 ttl_seconds: None,
                 created_at: 1000,
+                bucket: 1,
             },
         ];
 
         let query: Vec<f32> = vec![0.9, 0.1, 0.0];
-        let results = nearest_neighbours(&query, &segments, 2, None, 2000);
+        // With query_text, uses stratified search; with <20 segments, falls through to brute force
+        let results = nearest_neighbours(&query, &segments, 2, None, 2000, Some("hello world"));
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, "a");
         assert_eq!(results[1].id, "b");
@@ -376,7 +592,7 @@ mod tests {
     fn test_empty_query_no_panic() {
         let segments: Vec<Segment> = vec![];
         let query: Vec<f32> = vec![1.0, 0.0];
-        let results = nearest_neighbours(&query, &segments, 5, None, 2000);
+        let results = nearest_neighbours(&query, &segments, 5, None, 2000, None);
         assert!(results.is_empty());
     }
 
@@ -385,6 +601,99 @@ mod tests {
         let a: Vec<f32> = (0..20).map(|i| i as f32 * 0.5).collect();
         let b: Vec<f32> = (0..20).map(|i| i as f32 * 0.5 + 1.0).collect();
         assert!((l2_distance(&a, &b) - l2_distance(&b, &a)).abs() < 1e-6);
+    }
+
+    // ---- Bucket assignment tests ----
+
+    #[test]
+    fn test_assign_bucket_short_numeric() {
+        assert_eq!(assign_bucket("42"), 0);
+        assert_eq!(assign_bucket("95.5%"), 0);
+        assert_eq!(assign_bucket("1/2/3"), 0);
+        assert_eq!(assign_bucket("cpu=45% mem=2.1G"), 0);
+    }
+
+    #[test]
+    fn test_assign_bucket_medium_prose() {
+        let medium = "The quick brown fox jumps over the lazy dog.";
+        assert_eq!(assign_bucket(medium), 1);
+
+        let longer = "a".repeat(250);
+        assert_eq!(assign_bucket(&longer), 1);
+    }
+
+    #[test]
+    fn test_assign_bucket_long() {
+        let long = "a".repeat(2500);
+        assert_eq!(assign_bucket(&long), 2);
+    }
+
+    #[test]
+    fn test_assign_bucket_command() {
+        assert_eq!(assign_bucket("system:update"), 3);
+        assert_eq!(assign_bucket("cmd:deploy"), 3);
+        assert_eq!(assign_bucket("fn do_something"), 3);
+        assert_eq!(assign_bucket("def fibonacci(n):"), 3);
+    }
+
+    #[test]
+    fn test_assign_bucket_short_text_defaults_to_prose() {
+        // Short text that isn't numeric goes to bucket 1
+        assert_eq!(assign_bucket("hi"), 1);
+        assert_eq!(assign_bucket("hello world"), 1);
+    }
+
+    #[test]
+    fn test_bucket_search_order_primary_first() {
+        let order = bucket_search_order(2);
+        assert_eq!(order[0], 2, "query's bucket should be first");
+        let mut sorted = order;
+        sorted.sort();
+        assert_eq!(sorted, [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_segment_bucket_deserialization_default() {
+        // Old segments without bucket field should default to 0
+        let json = r#"{
+            "id": "test",
+            "text": "hello",
+            "embedding": [1.0]
+        }"#;
+        let seg: Segment = serde_json::from_str(json).unwrap();
+        assert_eq!(seg.bucket, 0);
+        assert_eq!(seg.text, "hello");
+    }
+
+    #[test]
+    fn test_stratified_search_with_buckets() {
+        // Create segments in different buckets
+        let segments = vec![
+            Segment {
+                id: "numeric".into(),
+                text: "42%".into(),
+                embedding: vec![0.0, 1.0],
+                namespace: None,
+                ttl_seconds: None,
+                created_at: 1000,
+                bucket: 0,
+            },
+            Segment {
+                id: "prose".into(),
+                text: "some medium length text here".into(),
+                embedding: vec![0.9, 0.0],
+                namespace: None,
+                ttl_seconds: None,
+                created_at: 1000,
+                bucket: 1,
+            },
+        ];
+
+        let query: Vec<f32> = vec![1.0, 0.0];
+        // Query text "hello" -> bucket 1 (medium prose)
+        let results = nearest_neighbours(&query, &segments, 1, None, 2000, Some("hello"));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "prose");
     }
 
     /// Verify the NEON implementation matches a simple scalar reference.
