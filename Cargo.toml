@@ -2,7 +2,10 @@
 name = "headspace-rs"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/SuperInstance/headspace-rs"
 description = "ARM-optimized vector embedding sidecar for headspace"
+
+keywords = ["headspace-rs"]
 
 [dependencies]
 axum = "0.8"
